@@ -350,7 +350,9 @@ class SigenBatterySOCNumber(SigenSettingsEntity, NumberEntity):
         )
         if settings is None:
             return None
-        return float(getattr(settings, self._SOC_FIELD[self.entity_description.key]))
+        value = getattr(settings, self._SOC_FIELD[self.entity_description.key])
+        # Sigen sends "" for an unset threshold (peakShavingSOC); the model has None.
+        return None if value is None else float(value)
 
     async def async_set_native_value(self, value: float) -> None:
         current: BatteryLevelSettings = self.coordinator.data["battery_level"]

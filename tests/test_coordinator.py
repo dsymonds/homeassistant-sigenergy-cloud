@@ -233,6 +233,8 @@ class SettingsCoordinatorTest(unittest.TestCase):
             enabled_modules={const.MODULE_STATION_SETTINGS},
         )
 
+        # Slow endpoints are spread over cycles (3 per cycle).
+        settings.data = asyncio.run(settings._async_update_data())
         data = asyncio.run(settings._async_update_data())
 
         self.assertEqual(

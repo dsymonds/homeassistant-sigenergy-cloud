@@ -20,6 +20,7 @@ from sigenergy_cloud import (
     SigenergyCloudAuthError,
     SigenergyCloudClient,
     SigenergyCloudError,
+    SigenergyCloudRateLimitError,
 )
 
 from .const import (
@@ -27,7 +28,12 @@ from .const import (
     DOMAIN,
     enabled_modules_from_options,
 )
-from .coordinator import SigenSettingsCoordinator, SigenStatusCoordinator
+from .coordinator import (
+    SigenSettingsCoordinator,
+    SigenStatusCoordinator,
+    activate_rate_limit_backoff,
+    rate_limit_backoff_remaining,
+)
 from .data import SigenData
 from .session import SigenergyCloudSession
 
@@ -50,6 +56,9 @@ SERVICE_SET_INSTANT_MANUAL_CONTROL = "set_instant_manual_control"
 SERVICE_DISABLE_INSTANT_MANUAL_CONTROL = "disable_instant_manual_control"
 SERVICE_REFRESH_DEVICE_STATUS = "refresh_device_status"
 SERVICE_SYNC_NORDPOOL_TAX_AND_FEES = "sync_nordpool_tax_and_fees"
+
+# hass.data[DOMAIN] key: settings coordinator state kept across entry reloads.
+_SETTINGS_STATE = "settings_state"
 
 _INSTANT_MANUAL_MODE_ALIASES = {
     "0": InstantManualMode.CHARGING,
@@ -212,6 +221,9 @@ async def async_setup_entry(
         await client.connect()
     except SigenergyCloudAuthError as exc:
         raise ConfigEntryAuthFailed(exc) from exc
+    except SigenergyCloudRateLimitError as exc:
+        activate_rate_limit_backoff("Sigen connect", exc)
+        raise ConfigEntryNotReady(exc) from exc
     except SigenergyCloudError as exc:
         raise ConfigEntryNotReady(exc) from exc
 
@@ -222,9 +234,22 @@ async def async_setup_entry(
     status_coordinator = SigenStatusCoordinator(
         hass, client, enabled_modules=enabled_modules
     )
+    # A reload starts from the previous coordinator's data and slow cache
+    # instead of a cold burst of cloud reads.
+    saved_state = (
+        hass.data.get(DOMAIN, {}).get(_SETTINGS_STATE, {}).pop(entry.entry_id, None)
+    )
+    if saved_state:
+        settings_coordinator.restore_state(saved_state)
 
-    await settings_coordinator.async_config_entry_first_refresh()
-    await status_coordinator.async_config_entry_first_refresh()
+    for coordinator in (settings_coordinator, status_coordinator):
+        if rate_limit_backoff_remaining():
+            # Don't fail setup over a cloud cooldown: writes and services keep
+            # working, and entities without data stay unavailable until the
+            # first poll after the backoff.
+            await coordinator.async_refresh()
+        else:
+            await coordinator.async_config_entry_first_refresh()
 
     entry.runtime_data = SigenData(
         client=client,
@@ -247,6 +272,9 @@ async def async_unload_entry(
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
+        hass.data.setdefault(DOMAIN, {}).setdefault(_SETTINGS_STATE, {})[
+            entry.entry_id
+        ] = entry.runtime_data.settings_coordinator.export_state()
         await entry.runtime_data.client.close()
     return unload_ok
 

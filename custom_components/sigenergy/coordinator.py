@@ -31,9 +31,14 @@ _DC_PLUG_STATUS_IDLE_INTERVAL = timedelta(minutes=10)
 _DC_REALTIME_IDLE_INTERVAL = timedelta(minutes=10)
 _DC_STATUS_IDLE_INTERVAL = timedelta(minutes=10)
 _DC_V2X_IDLE_INTERVAL = timedelta(minutes=10)
-_TOPOLOGY_IDLE_INTERVAL = timedelta(minutes=2)
+_TOPOLOGY_IDLE_INTERVAL = timedelta(minutes=10)
 _DC_SLOW_INTERVAL = timedelta(hours=1)
 _DC_RARE_INTERVAL = timedelta(hours=6)
+# Charger history (session records, energy totals) drives no control.
+_DC_HISTORY_INTERVAL = timedelta(hours=6)
+# Sigen 429s short bursts. Refresh at most this many due slow endpoints per
+# settings cycle, so a cold start fills its cache over a few cycles.
+_SLOW_REFRESH_BUDGET = 3
 _ACTIVE_ALARMS_INTERVAL = timedelta(minutes=30)
 # After AIO power change, burst-poll topology deviceStatus longer than normal.
 _AIO_POWER_FAST_POLL_S = 180.0
@@ -64,12 +69,16 @@ class _RateLimitBackoff(Exception):  # noqa: N818
     """Raised internally to abort an update after the cloud rate-limits us."""
 
 
-def _rate_limit_backoff_remaining() -> float:
+# Returned by SigenSettingsCoordinator._fetch when a read failed or was skipped.
+_MISSING = object()
+
+
+def rate_limit_backoff_remaining() -> float:
     """Return remaining shared cloud-polling backoff seconds."""
     return max(0.0, _RATE_LIMIT_BACKOFF_UNTIL - time.monotonic())
 
 
-def _activate_rate_limit_backoff(label: str, exc: Exception) -> None:
+def activate_rate_limit_backoff(label: str, exc: Exception) -> None:
     """Start a shared cooldown after Sigenergy rate-limits a request."""
     global _RATE_LIMIT_BACKOFF_UNTIL  # noqa: PLW0603
 
@@ -309,6 +318,28 @@ class SigenSettingsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._prediction_data_updated_at: datetime | None = None
         self._slow_cache: dict[str, Any] = {}
         self._slow_cache_updated_at: dict[str, datetime] = {}
+        self._slow_refresh_budget = _SLOW_REFRESH_BUDGET
+
+    def export_state(self) -> dict[str, Any]:
+        """Return last-good data and caches so a reload can start warm."""
+        return {
+            "data": self.data,
+            "available_modes": dict(self.available_modes),
+            "prediction_data_cache": self._prediction_data_cache,
+            "prediction_data_updated_at": self._prediction_data_updated_at,
+            "slow_cache": dict(self._slow_cache),
+            "slow_cache_updated_at": dict(self._slow_cache_updated_at),
+        }
+
+    def restore_state(self, state: dict[str, Any]) -> None:
+        """Seed a new coordinator from export_state() of the previous one."""
+        if state.get("data") is not None:
+            self.data = state["data"]
+        self.available_modes.update(state.get("available_modes") or {})
+        self._prediction_data_cache = state.get("prediction_data_cache")
+        self._prediction_data_updated_at = state.get("prediction_data_updated_at")
+        self._slow_cache.update(state.get("slow_cache") or {})
+        self._slow_cache_updated_at.update(state.get("slow_cache_updated_at") or {})
 
     def dc_sns(self) -> list[str]:
         """Return known DC charger serial numbers."""
@@ -360,7 +391,28 @@ class SigenSettingsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 data["dc_charge_setting"] = updates["charge_setting"]
         self.async_set_updated_data(data)
 
-    async def _prediction_data(self, safe) -> dict[str, Any] | None:
+    async def _fetch(self, coro, label: str) -> Any:
+        """
+        Await a cloud read, or return _MISSING when it failed or was skipped.
+
+        A 429 starts the shared backoff; every later read in the cycle is then
+        skipped without a request, so callers keep their last-known values.
+        """
+        if rate_limit_backoff_remaining():
+            coro.close()
+            return _MISSING
+        try:
+            return await coro
+        except SigenergyCloudAuthError:
+            raise
+        except SigenergyCloudRateLimitError as exc:
+            activate_rate_limit_backoff(f"Sigen settings: {label}", exc)
+            return _MISSING
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Sigen settings: %s failed: %s", label, exc)
+            return _MISSING
+
+    async def _prediction_data(self) -> dict[str, Any] | None:
         """Return cached AI prediction data, refreshing it at a slower cadence."""
         if not self.module_enabled(MODULE_FORECAST):
             return None
@@ -373,11 +425,7 @@ class SigenSettingsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ):
             return self._prediction_data_cache
 
-        data = await safe(
-            self.client.prediction_data(),
-            "prediction_data",
-            self._prediction_data_cache,
-        )
+        data = await self._fetch(self.client.prediction_data(), "prediction_data")
         if isinstance(data, dict):
             self._prediction_data_cache = data
             self._prediction_data_updated_at = now
@@ -385,71 +433,76 @@ class SigenSettingsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _cached_data(
         self,
-        safe,
         label: str,
         factory,
         interval: timedelta,
         fallback=None,
     ) -> Any:
-        """Return a cached slow payload, refreshing only after its own interval."""
-        now = datetime.now(UTC)
-        updated_at = self._slow_cache_updated_at.get(label)
-        if (
-            label in self._slow_cache
-            and updated_at is not None
-            and now - updated_at < interval
-        ):
-            return self._slow_cache[label]
+        """
+        Return a cached slow payload, refreshing only after its own interval.
 
-        data = await safe(factory(), label, self._slow_cache.get(label, fallback))
-        if data is not None:
-            self._slow_cache[label] = data
-            self._slow_cache_updated_at[label] = now
+        Due refreshes share a per-cycle budget; the rest wait for a later cycle.
+        """
+        now = datetime.now(UTC)
+        last_known = self._slow_cache.get(label, fallback)
+        updated_at = self._slow_cache_updated_at.get(label)
+        if updated_at is not None and now - updated_at < interval:
+            return last_known
+        if self._slow_refresh_budget <= 0 or rate_limit_backoff_remaining():
+            return last_known
+
+        self._slow_refresh_budget -= 1
+        data = await self._fetch(factory(), label)
+        if data is _MISSING:
+            if not rate_limit_backoff_remaining():
+                # Failed for another reason: retry within the hour instead of
+                # spending budget on it every cycle.
+                self._slow_cache_updated_at[label] = now - max(
+                    interval - _DC_SLOW_INTERVAL, timedelta(0)
+                )
+            return last_known
+        self._slow_cache_updated_at[label] = now
+        if data is None:
+            return last_known
+        self._slow_cache[label] = data
         return data
 
     async def _async_update_data(self) -> dict[str, Any]:
-        if _rate_limit_backoff_remaining():
-            return self.data or {}
+        if rate_limit_backoff_remaining():
+            if self.data is None:
+                # No data yet: report a failed refresh (entities unavailable),
+                # never a successful one with nothing in it.
+                msg = "Sigen cloud rate limit backoff active; no settings data yet"
+                raise UpdateFailed(msg)
+            return self.data
+
+        self._slow_refresh_budget = _SLOW_REFRESH_BUDGET
 
         # Each section is fetched independently; one transient failure
         # shouldn't blank out every entity. Auth failures still bubble.
+        # After a 429 the rest of the cycle keeps its last-known values.
         async def safe(coro, label, fallback=None):
-            try:
-                return await coro
-            except SigenergyCloudAuthError:
-                raise
-            except SigenergyCloudRateLimitError as exc:
-                _activate_rate_limit_backoff(f"Sigen settings: {label}", exc)
-                raise _RateLimitBackoff from exc
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.warning("Sigen settings: %s failed: %s", label, exc)
-                # Reuse last known value if we have one, else None.
-                if fallback is not None:
-                    return fallback
-                return (self.data or {}).get(label) if self.data else None
+            value = await self._fetch(coro, label)
+            if value is not _MISSING:
+                return value
+            if fallback is not None:
+                return fallback
+            return (self.data or {}).get(label)
 
         try:
             station_settings_enabled = self.module_enabled(MODULE_STATION_SETTINGS)
             forecast_enabled = self.module_enabled(MODULE_FORECAST)
 
             if station_settings_enabled and not self.available_modes:
-                try:
-                    modes_data = await self.client.available_operational_modes()
+                modes_data = await self._fetch(
+                    self.client.available_operational_modes(),
+                    "available_operational_modes",
+                )
+                if isinstance(modes_data, dict):
                     for m in modes_data.get("defaultWorkingModes", []):
                         self.available_modes[m["label"]] = (int(m["value"]), -1)
                     for m in modes_data.get("energyProfileItems", []):
                         self.available_modes[m["name"]] = (9, m["profileId"])
-                except SigenergyCloudAuthError:
-                    raise
-                except SigenergyCloudRateLimitError as exc:
-                    _activate_rate_limit_backoff(
-                        "Sigen settings: available_operational_modes", exc
-                    )
-                    raise _RateLimitBackoff from exc
-                except Exception as exc:  # noqa: BLE001
-                    LOGGER.warning(
-                        "Sigen settings: available_operational_modes failed: %s", exc
-                    )
 
             data: dict[str, Any] = {
                 "dc_charge_soc_range": None,
@@ -460,7 +513,6 @@ class SigenSettingsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             if station_settings_enabled:
                 station_home = await self._cached_data(
-                    safe,
                     "station_home",
                     self.client.refresh_station,
                     _DC_RARE_INTERVAL,
@@ -509,19 +561,16 @@ class SigenSettingsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         ),
                         # Read-only ceilings that change rarely; refresh hourly.
                         "battery_power_limit": await self._cached_data(
-                            safe,
                             "battery_power_limit",
                             self.client.battery_power_limit,
                             _DC_SLOW_INTERVAL,
                         ),
                         "solar_power_limit": await self._cached_data(
-                            safe,
                             "solar_power_limit",
                             self.client.solar_power_limit,
                             _DC_SLOW_INTERVAL,
                         ),
                         "backup_reserve": await self._cached_data(
-                            safe,
                             "backup_reserve",
                             self.client.backup_reserve,
                             _DC_SLOW_INTERVAL,
@@ -537,7 +586,7 @@ class SigenSettingsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if forecast_enabled:
                 data.update(
                     {
-                        "prediction_data": await self._prediction_data(safe),
+                        "prediction_data": await self._prediction_data(),
                         "prediction_data_fetched_at": (
                             self._prediction_data_updated_at.isoformat()
                             if self._prediction_data_updated_at is not None
@@ -553,7 +602,6 @@ class SigenSettingsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             dc_sns = self.dc_sns()
             if dc_sns:
                 data["dc_charge_soc_range"] = await self._cached_data(
-                    safe,
                     "dc_charge_soc_range",
                     self.client.dc_charge_mode_soc_range,
                     _DC_RARE_INTERVAL,
@@ -573,28 +621,24 @@ class SigenSettingsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         last_dc.get("charge_setting"),
                     ),
                     "energy_totals": await self._cached_data(
-                        safe,
                         f"dc_charger_energy {dc_sn}",
                         lambda dc_sn=dc_sn: self.client.dc_energy_totals(dc_sn=dc_sn),
-                        _DC_SLOW_INTERVAL,
+                        _DC_HISTORY_INTERVAL,
                         last_dc.get("energy_totals"),
                     ),
                     "lifetime_totals": await self._cached_data(
-                        safe,
                         f"dc_charger_total {dc_sn}",
                         lambda dc_sn=dc_sn: self.client.dc_lifetime_totals(dc_sn=dc_sn),
                         _DC_RARE_INTERVAL,
                         last_dc.get("lifetime_totals"),
                     ),
                     "ocpp_status": await self._cached_data(
-                        safe,
                         f"ocpp_status {dc_sn}",
                         lambda dc_sn=dc_sn: self.client.dc_ocpp_status(dc_sn=dc_sn),
                         _DC_SLOW_INTERVAL,
                         last_dc.get("ocpp_status"),
                     ),
                     "session_records": await self._cached_data(
-                        safe,
                         f"dc_charger_session_records {dc_sn}",
                         lambda dc_sn=dc_sn: self.client.dc_session_records(
                             dc_sn=dc_sn,
@@ -603,7 +647,7 @@ class SigenSettingsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             page=1,
                             page_size=10,
                         ),
-                        _DC_SLOW_INTERVAL,
+                        _DC_HISTORY_INTERVAL,
                         last_dc.get("session_records"),
                     ),
                 }
@@ -611,7 +655,6 @@ class SigenSettingsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             if dc_sns:
                 active_alarms_payload = await self._cached_data(
-                    safe,
                     "active_alarms",
                     lambda: self.client.active_alarms(page=1, page_size=10),
                     _ACTIVE_ALARMS_INTERVAL,
@@ -634,10 +677,6 @@ class SigenSettingsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "charge_setting"
                 ]
             return data
-        except _RateLimitBackoff as exc:
-            if self.data is not None:
-                return self.data
-            raise UpdateFailed(exc) from exc
         except SigenergyCloudAuthError as exc:
             raise ConfigEntryAuthFailed(exc) from exc
         except SigenergyCloudError as exc:
@@ -812,8 +851,11 @@ class SigenStatusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             dc_data["topology_node_found"] = True
 
     async def _async_update_data(self) -> dict[str, Any]:
-        if _rate_limit_backoff_remaining():
-            return self.data or {}
+        if rate_limit_backoff_remaining():
+            if self.data is None:
+                msg = "Sigen cloud rate limit backoff active; no status data yet"
+                raise UpdateFailed(msg)
+            return self.data
 
         try:
             last = self.data or {}
@@ -822,7 +864,7 @@ class SigenStatusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             except SigenergyCloudAuthError:
                 raise
             except SigenergyCloudRateLimitError as exc:
-                _activate_rate_limit_backoff("Sigen status: energy_flow", exc)
+                activate_rate_limit_backoff("Sigen status: energy_flow", exc)
                 raise _RateLimitBackoff from exc
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("Sigen status: energy_flow failed: %s", exc)
@@ -872,7 +914,7 @@ class SigenStatusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 except SigenergyCloudAuthError:
                     raise
                 except SigenergyCloudRateLimitError as exc:
-                    _activate_rate_limit_backoff("Sigen status: is_charging", exc)
+                    activate_rate_limit_backoff("Sigen status: is_charging", exc)
                     raise _RateLimitBackoff from exc
                 except Exception as exc:  # noqa: BLE001
                     LOGGER.warning("Sigen status: is_charging failed: %s", exc)
@@ -910,7 +952,7 @@ class SigenStatusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     except SigenergyCloudAuthError:
                         raise
                     except SigenergyCloudRateLimitError as exc:
-                        _activate_rate_limit_backoff(
+                        activate_rate_limit_backoff(
                             f"Sigen status: dc_plug_status {dc_sn}", exc
                         )
                         raise _RateLimitBackoff from exc
@@ -985,7 +1027,7 @@ class SigenStatusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     except SigenergyCloudAuthError:
                         raise
                     except SigenergyCloudRateLimitError as exc:
-                        _activate_rate_limit_backoff(
+                        activate_rate_limit_backoff(
                             f"Sigen status: dc_charge_realtime {dc_sn}", exc
                         )
                         raise _RateLimitBackoff from exc
@@ -1027,7 +1069,7 @@ class SigenStatusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     except SigenergyCloudAuthError:
                         raise
                     except SigenergyCloudRateLimitError as exc:
-                        _activate_rate_limit_backoff(
+                        activate_rate_limit_backoff(
                             f"Sigen status: dc_status {dc_sn}", exc
                         )
                         raise _RateLimitBackoff from exc
@@ -1125,7 +1167,7 @@ class SigenStatusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     except SigenergyCloudAuthError:
                         raise
                     except SigenergyCloudRateLimitError as exc:
-                        _activate_rate_limit_backoff(
+                        activate_rate_limit_backoff(
                             f"Sigen status: V2X status {dc_sn}", exc
                         )
                         raise _RateLimitBackoff from exc
@@ -1157,7 +1199,7 @@ class SigenStatusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 except SigenergyCloudAuthError:
                     raise
                 except SigenergyCloudRateLimitError as exc:
-                    _activate_rate_limit_backoff("Sigen status: topology", exc)
+                    activate_rate_limit_backoff("Sigen status: topology", exc)
                     raise _RateLimitBackoff from exc
                 except Exception as exc:  # noqa: BLE001
                     LOGGER.warning("Sigen status: topology failed: %s", exc)

@@ -47,6 +47,7 @@ ignore = [
     "N818", # Test doubles mirror library exception names
     "PT009", # Tests use unittest.TestCase assertions
     "PT018", # Composite assertions keep related checks together
+    "PT027", # Tests use unittest.TestCase assertRaises
     "S101", # assert is how pytest checks
     "SLF001", # Tests inspect private coordinator state
 ]
