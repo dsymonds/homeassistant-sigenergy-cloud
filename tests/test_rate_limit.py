@@ -326,3 +326,40 @@ class TopologyIntervalTest(_BackoffResetMixin, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _FlowClient(_RecordingSettingsClient):
+    dc_sn = None
+    dc_sns = ()
+
+    def __init__(self, flow):
+        super().__init__()
+        self.flow = flow
+
+    async def energy_flow(self):
+        if isinstance(self.flow, Exception):
+            raise self.flow
+        return self.flow
+
+
+class OnGridTest(_BackoffResetMixin, unittest.TestCase):
+    """binary_sensor.sigenergy_cloud_on_grid reads only this poll's onGrid."""
+
+    def _status(self, flow, last=None):
+        status = coordinator.SigenStatusCoordinator(
+            None, _FlowClient(flow), enabled_modules=SETTINGS_MODULES
+        )
+        status.data = last
+        return asyncio.run(status._async_update_data())
+
+    def test_on_grid_and_island_come_from_energy_flow(self) -> None:
+        on = self._status({"onGrid": True, "onOffGridStatus": 0})
+        self.assertIs(on["on_grid"], True)
+        self.assertEqual(on["on_off_grid_status"], 0)
+        self.assertIs(self._status({"onGrid": False})["on_grid"], False)
+
+    def test_failed_energy_flow_does_not_carry_the_last_on_grid(self) -> None:
+        last = {"on_grid": True, "grid_power": 1.0}
+        data = self._status(RuntimeError("boom"), last=last)
+        self.assertIsNone(data["on_grid"])
+        self.assertEqual(data["grid_power"], 1.0)

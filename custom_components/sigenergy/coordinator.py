@@ -899,6 +899,9 @@ class SigenStatusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "load_power": flow.get("loadPower", last.get("load_power")),
                 "battery_power": flow.get("batteryPower", last.get("battery_power")),
                 "battery_soc": flow.get("batterySoc", last.get("battery_soc")),
+                # This poll's value only: a stale onGrid must never vouch for the grid.
+                "on_grid": flow["onGrid"] if isinstance(flow.get("onGrid"), bool) else None,
+                "on_off_grid_status": flow.get("onOffGridStatus"),
                 "dc_chargers": {},
             }
 

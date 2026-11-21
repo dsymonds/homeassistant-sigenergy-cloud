@@ -10,7 +10,8 @@ from homeassistant.components.binary_sensor import (
 )
 
 from .const import MODULE_EVDC
-from .entity import SigenDCChargerStatusEntity
+from .coordinator import rate_limit_backoff_remaining
+from .entity import SigenDCChargerStatusEntity, SigenStatusEntity
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -27,10 +28,13 @@ async def async_setup_entry(
 ) -> None:
     """Set up Sigenergy binary sensor entities."""
     data = entry.runtime_data
+    entities: list[BinarySensorEntity] = [
+        SigenOnGridBinarySensor(data.status_coordinator, data.client.station_id)
+    ]
     if not data.status_coordinator.module_enabled(MODULE_EVDC):
+        async_add_entities(entities)
         return
 
-    entities: list[BinarySensorEntity] = []
     for dc_sn in data.status_coordinator.dc_sns():
         entities.append(
             SigenDCChargerPluggedInBinarySensor(
@@ -47,6 +51,34 @@ async def async_setup_entry(
             )
         )
     async_add_entities(entities)
+
+
+class SigenOnGridBinarySensor(SigenStatusEntity, BinarySensorEntity):
+    """
+    Grid connection as the inverter reports it through the cloud (energy flow onGrid).
+
+    A fallback for local status: unknown when the last poll returned no energy
+    flow or the cloud backoff serves an old poll, so it never reports a stale grid.
+    """
+
+    _attr_translation_key = "on_grid"
+    _attr_device_class = BinarySensorDeviceClass.POWER
+    _attr_icon = "mdi:transmission-tower"
+
+    def __init__(self, coordinator: SigenStatusCoordinator, station_id: str) -> None:
+        super().__init__(coordinator, station_id, "on_grid")
+        self.entity_id = "binary_sensor.sigenergy_cloud_on_grid"
+
+    @property
+    def is_on(self) -> bool | None:
+        if self.coordinator.data is None or rate_limit_backoff_remaining():
+            return None
+        return self.coordinator.data.get("on_grid")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self.coordinator.data or {}
+        return {"on_off_grid_status": data.get("on_off_grid_status")}
 
 
 class SigenDCChargerPluggedInBinarySensor(

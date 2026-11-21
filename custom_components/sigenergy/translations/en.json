@@ -76,6 +76,9 @@
       }
     },
     "binary_sensor": {
+      "on_grid": {
+        "name": "On Grid"
+      },
       "dc_charger_plugged_in": {
         "name": "Plugged In"
       },
