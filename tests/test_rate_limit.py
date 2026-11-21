@@ -84,9 +84,43 @@ def _slow_calls(client) -> list[str]:
 class _BackoffResetMixin:
     def setUp(self) -> None:
         coordinator._RATE_LIMIT_BACKOFF_UNTIL = 0.0
+        coordinator._RATE_LIMIT_BACKOFF_UNTIL_UTC = None
 
     def tearDown(self) -> None:
         coordinator._RATE_LIMIT_BACKOFF_UNTIL = 0.0
+        coordinator._RATE_LIMIT_BACKOFF_UNTIL_UTC = None
+
+
+class BackoffUntilTest(_BackoffResetMixin, unittest.TestCase):
+    """sensor.sigenergy_cloud_rate_limited_until reads rate_limit_backoff_until()."""
+
+    def test_none_without_backoff(self) -> None:
+        self.assertIsNone(coordinator.rate_limit_backoff_until())
+
+    def test_wall_clock_end_while_backing_off(self) -> None:
+        before = datetime.now(UTC)
+        coordinator.activate_rate_limit_backoff("test", RateLimitError("429"))
+        until = coordinator.rate_limit_backoff_until()
+        self.assertIsNotNone(until)
+        self.assertEqual(until.tzinfo, UTC)
+        expected = before + coordinator._RATE_LIMIT_BACKOFF_INTERVAL
+        self.assertLess(abs((until - expected).total_seconds()), 5)
+        # Stable between polls, so the sensor does not write a new state each time.
+        self.assertEqual(coordinator.rate_limit_backoff_until(), until)
+
+    def test_a_later_429_extends_the_end(self) -> None:
+        coordinator.activate_rate_limit_backoff("first", RateLimitError("429"))
+        # As if the first 429 came a minute ago.
+        coordinator._RATE_LIMIT_BACKOFF_UNTIL -= 60
+        coordinator._RATE_LIMIT_BACKOFF_UNTIL_UTC -= timedelta(seconds=60)
+        until = coordinator.rate_limit_backoff_until()
+        coordinator.activate_rate_limit_backoff("second", RateLimitError("429"))
+        self.assertGreater(coordinator.rate_limit_backoff_until(), until)
+
+    def test_none_once_the_backoff_has_ended(self) -> None:
+        coordinator.activate_rate_limit_backoff("test", RateLimitError("429"))
+        coordinator._RATE_LIMIT_BACKOFF_UNTIL = 0.0
+        self.assertIsNone(coordinator.rate_limit_backoff_until())
 
 
 class SettingsRateLimitTest(_BackoffResetMixin, unittest.TestCase):

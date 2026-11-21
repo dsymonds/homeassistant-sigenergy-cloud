@@ -25,6 +25,7 @@ from homeassistant.util import dt as dt_util
 from sigenergy_cloud import is_unlimited_power
 
 from .const import MODULE_EVDC, MODULE_FORECAST, MODULE_STATION_SETTINGS
+from .coordinator import rate_limit_backoff_until
 from .entity import (
     SigenDCChargerSettingsEntity,
     SigenDCChargerStatusEntity,
@@ -610,6 +611,9 @@ async def async_setup_entry(
         )
         for description in ENERGY_FLOW_SENSORS
     ]
+    entities.append(
+        SigenRateLimitedUntilSensor(data.status_coordinator, data.client.station_id)
+    )
     if data.settings_coordinator.module_enabled(MODULE_FORECAST):
         entities.extend(
             SigenForecastCurveSensor(
@@ -771,6 +775,38 @@ class SigenEnergyFlowSensor(SigenStatusEntity, SensorEntity):
             "native_pv_power_kw": self.coordinator.data.get("native_pv_power"),
             "third_party_pv_power_kw": self.coordinator.data.get(
                 "third_party_pv_power"
+            ),
+        }
+
+
+class SigenRateLimitedUntilSensor(SigenStatusEntity, SensorEntity):
+    """When the shared cloud-polling backoff after a 429 ends; unknown when none is active."""
+
+    _attr_translation_key = "rate_limited_until"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:timer-sand"
+
+    def __init__(self, coordinator: SigenStatusCoordinator, station_id: str) -> None:
+        super().__init__(coordinator, station_id, "rate_limited_until")
+        # Stable id for automations (almis system_recovery pauses reloads on it).
+        self.entity_id = "sensor.sigenergy_cloud_rate_limited_until"
+
+    @property
+    def available(self) -> bool:
+        # A backoff is exactly when polls fail; the sensor must stay readable then.
+        return True
+
+    @property
+    def native_value(self) -> datetime | None:
+        return rate_limit_backoff_until()
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "description": (
+                "End of the shared Sigenergy cloud polling backoff that starts when "
+                "the cloud answers 429 Too Many Requests; unknown when no backoff "
+                "is active. The backoff resets on an HA restart."
             ),
         }
 

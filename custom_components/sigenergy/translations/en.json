@@ -255,6 +255,9 @@
       },
       "dc_charger_last_session_alarm_name": {
         "name": "Last Session Alarm Name"
+      },
+      "rate_limited_until": {
+        "name": "Rate Limited Until"
       }
     },
     "number": {

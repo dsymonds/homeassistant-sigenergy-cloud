@@ -43,6 +43,8 @@ _ACTIVE_ALARMS_INTERVAL = timedelta(minutes=30)
 # After AIO power change, burst-poll topology deviceStatus longer than normal.
 _AIO_POWER_FAST_POLL_S = 180.0
 _RATE_LIMIT_BACKOFF_UNTIL = 0.0
+# Wall-clock end of the same backoff, for sensor.sigenergy_cloud_rate_limited_until.
+_RATE_LIMIT_BACKOFF_UNTIL_UTC: datetime | None = None
 _DC_STATUS_CARRY_FORWARD_KEYS = (
     "plugged_in",
     "dc_charge_power",
@@ -78,13 +80,24 @@ def rate_limit_backoff_remaining() -> float:
     return max(0.0, _RATE_LIMIT_BACKOFF_UNTIL - time.monotonic())
 
 
+def rate_limit_backoff_until() -> datetime | None:
+    """Return when the shared cloud-polling backoff ends (UTC), or None when none is active."""
+    if rate_limit_backoff_remaining() <= 0:
+        return None
+    return _RATE_LIMIT_BACKOFF_UNTIL_UTC
+
+
 def activate_rate_limit_backoff(label: str, exc: Exception) -> None:
     """Start a shared cooldown after Sigenergy rate-limits a request."""
-    global _RATE_LIMIT_BACKOFF_UNTIL  # noqa: PLW0603
+    global _RATE_LIMIT_BACKOFF_UNTIL, _RATE_LIMIT_BACKOFF_UNTIL_UTC  # noqa: PLW0603
 
     until = time.monotonic() + _RATE_LIMIT_BACKOFF_INTERVAL.total_seconds()
     if until > _RATE_LIMIT_BACKOFF_UNTIL:
         _RATE_LIMIT_BACKOFF_UNTIL = until
+        # Fixed at activation so the sensor state does not drift between polls.
+        _RATE_LIMIT_BACKOFF_UNTIL_UTC = (
+            datetime.now(UTC) + _RATE_LIMIT_BACKOFF_INTERVAL
+        ).replace(microsecond=0)
         LOGGER.warning(
             "Sigen cloud rate-limited %s; backing off polling for %.0f minutes: %s",
             label,
